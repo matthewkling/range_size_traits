@@ -1,0 +1,283 @@
+---
+title: "Traits & Range Size"
+author: "Matthew Kling"
+date: "January 27, 2016"
+output: html_document
+---
+
+
+This is a first pass at using BIEN data to explore relationships between plant traits and range sizes. Input datasets include range size, functional traits, and habit.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(out.width=2000, out.height=1500, dpi=200)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+
+trr <- readRDS("E:/BIEN/traits_ranges/data/traits.rds")
+tr <- trr %>%
+      distinct() %>%
+      select(family, genus, taxon, trait_name, trait_value) %>%
+      na.omit() %>%
+      group_by(family, genus, taxon, trait_name) %>%
+      summarize(trait_value=mean(as.numeric(trait_value), na.rm=T)) %>%
+      mutate(trait_name = gsub(" ", "_", trait_name)) %>%
+      filter(trait_value != 0) %>%
+      spread(trait_name, trait_value) %>%
+      mutate(Leaf_NP_ratio = Leaf_Nmass / Leaf_Pmass) %>%
+      gather(trait_name, trait_value, -taxon, -genus, -family) %>%
+      na.omit()
+
+# records per trait
+#ggplot(tr, aes(trait_name)) + geom_histogram()
+frq <- as.data.frame(table(tr$trait_name))
+tr <- filter(tr, trait_name %in% frq$Var1[frq$Freq>1000] &
+                   trait_name != "Flowering_month") %>% # only include widely recorded traits
+      mutate(trait_name=as.character(trait_name))
+
+# add habit data
+h <- read.table("E:/BIEN/traits_ranges/data/Habit_Final.txt", sep="\t", header=T) %>%
+      mutate(taxon=Accepted_name, habit=BIENHABIT) %>%
+      select(taxon, habit)
+tr <- left_join(tr, h)
+frq <- as.data.frame(table(tr$habit))
+tr <- filter(tr, habit %in% frq$Var1[frq$Freq>1000]) # only include widely recorded traits
+
+# add range size
+load("E:/BIEN/traits_ranges/data/allNewAreas.rdata")
+
+rr <- Areas %>%
+      mutate(taxon=Latin) %>%
+      select(-Latin)
+#rd <- gather(rr, variable, value, -taxon)
+rr <- select(rr, taxon, sampleSize, clippedHullArea, updArea)
+
+d <- left_join(tr, rr) %>%
+      gather(range_name, range_value, -family, -genus, -taxon, -trait_name, -trait_value, -habit) %>%
+      #mutate(trait_name_break = gsub(" ", "\n", trait_name)) %>%
+      na.omit()
+```
+
+
+First, a quick look at the input data. After joining the three datasets and doing some cleanup and filtering (e.g. I am ignorning traits and habits with less than 1000 records) the dataset contains `r nrow(d)` records covering `r length(unique(d$taxon))` species. It's very sparse -- the typical species has values for just 1-2 traits. 
+
+I'm looking at three variables from the range size dataset: `sampleSize` (number of occurrence points), `clippedHullArea` (convex hull around points with water clipped out; this is N/A for species with <3 points), and `updArea` (a combo of these other two, in which species with no hull area are assigned the area of one grid cell; this results in a bimodal distribution).
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(d, aes(range_value)) +
+      geom_density() +
+      facet_wrap(~range_name, scales="free") +
+      scale_x_log10() +
+      theme_bw()
+```
+
+
+# Traits ~ Habit
+Correlations among predictors -- how do functional traits vary by life form?
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(tr, aes(habit, trait_value, color=habit, fill=habit)) +
+      geom_boxplot(alpha=.5) +
+      scale_y_log10() +
+      facet_wrap(~trait_name, scales="free", ncol=4) +
+      labs(title="Trait distributions by habit", y="trait value (log scale)") +
+      theme_bw() +
+      theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+            legend.position="top")
+```
+
+
+# Range ~ Traits + Habit
+These are the main results -- relationships between traits and range size, in log-log space, with 2.5% of the data removed on each end of both dimensions to deal with outliers. Linear trends are fit for each habit (colored) and overall (black). We can look at these relationships on three levels:
+
+### Species-level
+Raw values, one point per species. Log-log scale. 
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+level <- "species"
+
+dl <- d
+title <- paste0(level, "-level")
+
+dtl <- dl %>%
+      group_by(trait_name, habit) %>%
+      mutate(percentile = ecdf(trait_value)(trait_value)) %>%
+      filter(percentile > .025 & percentile < .975) %>%
+      group_by(range_name, habit) %>%
+      mutate(percentile = ecdf(range_value)(range_value)) %>%
+      filter(percentile > .025 & percentile < .975) %>%
+      select(-percentile)
+
+ggplot(dtl, aes(trait_value, range_value, color=habit)) +
+      geom_point(size=.5, alpha=.3) +
+      geom_smooth(color="black", se=F, size=1, method=lm) +
+      geom_smooth(se=F, size=1, method=lm) +
+      facet_grid(range_name~trait_name, scales="free") +
+      scale_x_log10() +
+      scale_y_log10() +
+      theme_bw() +
+      theme(legend.position="top")
+
+## correlations
+library(corrplot)
+w <- dtl %>%
+      mutate(trait_name=substr(trait_name, 1, 18)) %>%
+      spread(trait_name, trait_value) %>%
+      spread(range_name, range_value) %>%
+      filter(habit=="Tree") %>%
+      select(-family, -genus, -taxon, -habit) %>%
+      log10() %>%
+      as.matrix()
+w[!is.finite(w)] <- NA
+corrplot(cor(w, use="pairwise.complete.obs"), main="\nCorrelations of log-transformed variables, trees only")
+```
+
+
+### Family-level
+One point per family, representing mean across species. Log-log scale.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+########### family ##########
+
+level <- "family"
+title <- paste0(level, "-level")
+
+dl <- d
+
+dl <- dl %>%
+      group_by(family, habit, trait_name, range_name) %>%
+      summarize(trait_value=mean(trait_value, na.rm=T),
+                range_value=mean(range_value, na.rm=T))
+
+dtl <- dl %>%
+      group_by(trait_name) %>%
+      mutate(percentile = ecdf(trait_value)(trait_value)) %>%
+      filter(percentile > .025 & percentile < .975) %>%
+      group_by(range_name) %>%
+      mutate(percentile = ecdf(range_value)(range_value)) %>%
+      filter(percentile > .025 & percentile < .975) %>%
+      select(-percentile)
+
+ggplot(dtl, aes(trait_value, range_value, color=habit)) +
+      geom_point(size=.5, alpha=.3) +
+      geom_smooth(color="black", se=F, size=1, method=lm) +
+      geom_smooth(se=F, size=1, method=lm) +
+      facet_grid(range_name~trait_name, scales="free") +
+      scale_x_log10() +
+      scale_y_log10() +
+      theme_bw() +
+      theme(legend.position="top")
+
+## correlations
+w <- dtl %>%
+      mutate(trait_name=substr(trait_name, 1, 18)) %>%
+      spread(trait_name, trait_value) %>%
+      spread(range_name, range_value) %>%
+      filter(habit=="Tree") %>%
+      select(-family, -habit) %>%
+      log10() %>%
+      as.matrix()
+w[!is.finite(w)] <- NA
+cm <- cor(w, use="pairwise.complete.obs")
+cm[is.na(cm)] <- 0
+corrplot(cm, main="\nCorrelations of log-transformed variables, trees only")
+
+```
+
+
+### Within-family
+Each species is compared only to other species in its family. Trait and range values are log-transformed, and then converted to within-family standard z-scores.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+scaleRank <- function(x){
+      x$trait_value <- scales::rescale(ecdf(x$trait_value)(x$trait_value))
+      x$range_value <- scales::rescale(ecdf(x$range_value)(x$range_value))
+      return(x)
+}
+scaleLog <- function(x){
+      x$trait_value <- log10(x$trait_value)
+      x$range_value <- log10(x$range_value)
+      x$trait_value <- (x$trait_value - mean(x$trait_value, na.rm=T)) / sd(x$trait_value)
+      x$range_value <- (x$range_value - mean(x$range_value, na.rm=T)) / sd(x$range_value)
+      return(x)
+}
+dl <- split(d, paste(d$family, d$trait_name, d$range_name, d$habit))
+dl <- do.call("rbind", lapply(dl, scaleLog))
+
+level <- "within-family"
+title <- "within-family anomalies, species-level"
+
+ggplot(dl, aes(trait_value, range_value, color=habit)) +
+      geom_point(size=.5, alpha=.3) +
+      geom_smooth(color="black", se=F, size=1, method=lm) +
+      geom_smooth(se=F, size=1, method=lm) +
+      facet_grid(range_name~trait_name, scales="free") +
+      theme_bw() +
+      theme(legend.position="top")
+```
+
+
+# Range ~ Habit
+How does range size vary by life form alone?
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# range size by habit
+dwl <- spread(d, trait_name, trait_value)
+ggplot(dwl, aes(habit, range_value, color=habit, fill=habit)) +
+      geom_boxplot(alpha=.5) +
+      scale_y_log10() +
+      facet_wrap(~range_name, scales="free", ncol=4) +
+      labs(title="Range size by habit", y="range value (log scale)") +
+      theme_bw() +
+      theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(),
+            legend.position="top")
+```
+
+
+# Range ~ Distinctiveness
+Beyond functional traits, phylogenetic structure is another possible predictor of range size. Here I'm using species per genus (etc) as a very crude proxy for evolutionary age or distinctiveness. The sample size is much larger here here as we can use all species, not just those with known traits.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+joiner <- select(tr, family, genus)
+
+rrr <- rr %>%
+      filter(!grepl(" x ", taxon),
+             substr(taxon, 1, 2) != "x ") %>%
+      separate(taxon, c("genus", "species"), sep=" ", remove=F) %>%
+      left_join(joiner) %>%
+      group_by(genus) %>%
+      mutate(species_per_genus = n()) %>%
+      ungroup() %>%
+      group_by(family) %>%
+      mutate(species_per_family = n(),
+             genera_per_family = length(unique(genus))) %>% 
+      ungroup() %>%
+      gather(range_name, range_value, sampleSize, clippedHullArea, updArea) %>%
+      gather(phylo_name, phylo_value, species_per_genus, species_per_family, genera_per_family) %>%
+      left_join(h) %>%
+      filter(habit %in% c("Tree", "Shrub", "Herb"))
+
+p <- ggplot(rrr, aes(phylo_value, range_value, color=habit)) +
+      geom_point(size=.2, alpha=.2) +
+      #geom_density2d() +
+      geom_smooth(se=F, size=1, method=lm) +
+      facet_grid(range_name~phylo_name, scales="free") +
+      scale_x_log10() +
+      scale_y_log10() +
+      theme_bw() +
+      theme(legend.position="top")
+
+```
+
+
+
+
+# Possible next steps
+
+* Find a way to estimate the proportion of range size variation explained by the predictor variables. This is nontrivial because very few species have more than a few known traits.
+* Consider imputing traits (using traditional or phylogenetic imputation).
+* Add geographic data (range location, biome, etc) as additional factor in analysis. Perhaps trait-range relationships differ by location? Perhaps range size should be normalized by available biome area?
+* Add phylogeny as another factor in analysis? Is somebody in BIEN already doing this? Questions include whether clade, branch length, evolutionary distinctiveness, etc predict range size. 
+
+
